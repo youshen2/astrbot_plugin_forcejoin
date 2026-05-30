@@ -1,0 +1,61 @@
+{
+  "target_group_id": {
+    "description": "目标群号",
+    "type": "string",
+    "hint": "新成员必须加入的目标群号。留空则插件不生效。"
+  },
+  "timeout_minutes": {
+    "description": "加群时限（分钟）",
+    "type": "int",
+    "default": 10,
+    "hint": "新成员入群后需在此时间内加入目标群，超时将被自动移出。"
+  },
+  "welcome_text": {
+    "description": "入群引导消息",
+    "type": "text",
+    "default": "欢迎新成员！请在 {timeout} 分钟内加入目标群 {target_group}，否则将被移出本群。",
+    "hint": "新成员入群时自动 @ 对方并发送此消息。可用占位符：{timeout}、{target_group}、{user_id}、{group_id}"
+  },
+  "kick_reason": {
+    "description": "踢出理由",
+    "type": "string",
+    "default": "未在规定时间内加入目标群",
+    "hint": "超时未加入目标群时，移出成员的附加说明。"
+  },
+  "group_whitelist": {
+    "description": "生效群白名单",
+    "type": "list",
+    "default": [],
+    "hint": "仅在此列表中的群启用强制入群规则。若同时设置了黑名单，则黑名单中的群会被排除。留空表示所有群均生效。"
+  },
+  "group_blacklist": {
+    "description": "生效群黑名单",
+    "type": "list",
+    "default": [],
+    "hint": "此列表中的群不启用强制入群规则。常用于在白名单范围内排除个别群。"
+  },
+  "mute_on_join": {
+    "description": "入群自动禁言",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，新成员入群时立即禁言；在时限内加入目标群后自动解除禁言。"
+  },
+  "user_whitelist": {
+    "description": "豁免用户（QQ号）",
+    "type": "list",
+    "default": [],
+    "hint": "列表中的用户入群后不触发任何规则，既不会收到引导消息，也不会被移出。"
+  },
+  "user_blacklist": {
+    "description": "拒绝用户（QQ号）",
+    "type": "list",
+    "default": [],
+    "hint": "列表中的用户入群后立即移出，不给予加群宽限期。"
+  },
+  "completed_welcome_text": {
+    "description": "完成加群通知",
+    "type": "text",
+    "default": "新成员 {user_id} 已加入目标群，欢迎！",
+    "hint": "成员成功加入目标群后，在原群发送的确认消息。可用占位符：{timeout}、{target_group}、{user_id}、{group_id}"
+  }
+}
