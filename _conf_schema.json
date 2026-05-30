@@ -56,6 +56,6 @@
     "description": "完成加群通知",
     "type": "text",
     "default": "新成员 {user_id} 已加入目标群，欢迎！",
-    "hint": "成员成功加入目标群后，在原群发送的确认消息。可用占位符：{timeout}、{target_group}、{user_id}、{group_id}"
+    "hint": "成员成功加入目标群后自动在原群 @ 对方并发送此消息。可用占位符：{timeout}、{target_group}、{user_id}、{group_id}"
   }
 }

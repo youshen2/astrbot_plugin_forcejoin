@@ -2,7 +2,7 @@ name: astrbot_plugin_forcejoin
 display_name: 强制入群
 desc: 当新成员入群后，对其发送提醒，要求其在限定时间内加入再次另外一个群，如果未能加入则自动踢出
 short_desc: 强制新入群的成员在限定时间内再次加入另外一个群（如通知群）
-version: v1.0.0
+version: v1.0.1
 author: 爅峫
 repo: https://github.com/youshen2/astrbot_plugin_forcejoin
 support_platforms:

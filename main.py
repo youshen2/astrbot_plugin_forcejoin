@@ -66,6 +66,11 @@ class ForceJoinPlugin(Star):
         await self._call("set_group_ban", group_id=int(group_id),
                          user_id=int(user_id), duration=0)
 
+    async def _check_in_group(self, user_id: str, group_id: str) -> bool:
+        info = await self._call("get_group_member_info",
+                                group_id=int(group_id), user_id=int(user_id))
+        return info is not None
+
     async def _check_privilege(self, group_id: str, user_id: str) -> bool:
         info = await self._call("get_group_member_info",
                                 group_id=int(group_id), user_id=int(user_id))
@@ -150,7 +155,8 @@ class ForceJoinPlugin(Star):
                 msg = text.format(user_id=user_id, target_group=target,
                                   group_id=info["group_id"],
                                   timeout=self.config.get("timeout_minutes", 10))
-                await self.context.send_message(umo, MessageChain().message(msg))
+                chain = MessageChain([Comp.At(qq=user_id), Comp.Plain(" " + msg)])
+                await self.context.send_message(umo, chain)
 
             logger.info(f"ForceJoin: {user_id} 已加入目标群")
             del self.pending_users[key]
@@ -172,6 +178,17 @@ class ForceJoinPlugin(Star):
             await self._kick(group_id, user_id)
             return
         if user_id in [str(u) for u in self.config.get("user_whitelist", [])]:
+            return
+
+        if await self._check_in_group(user_id, target):
+            logger.info(f"ForceJoin: {user_id} 已在目标群")
+            text = self.config.get("completed_welcome_text",
+                                   "新成员 {user_id} 已加入目标群，欢迎！")
+            msg = text.format(user_id=user_id, target_group=target,
+                              group_id=group_id,
+                              timeout=self.config.get("timeout_minutes", 10))
+            await event.send(event.chain_result(
+                [Comp.At(qq=user_id), Comp.Plain(" " + msg)]))
             return
 
         logger.info(f"ForceJoin: group={group_id}, user={user_id}")
