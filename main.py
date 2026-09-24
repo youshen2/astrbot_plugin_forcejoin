@@ -1,6 +1,8 @@
 import asyncio
 import time
 
+from aiocqhttp.exceptions import ActionFailed
+
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
@@ -8,12 +10,13 @@ from astrbot.api.star import Context, Star, register
 import astrbot.api.message_components as Comp
 
 
-@register("forcejoin", "爅峫", "支持多目标群验证及目标群成员自动清理", "1.1.0")
+@register("forcejoin", "爅峫", "支持多目标群验证及目标群成员自动清理", "1.1.1")
 class ForceJoinPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.config = config or {}
         self.pending_users: dict[str, dict] = {}
+        self._pending_lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
         self._cleanup_task: asyncio.Task | None = None
         self._cleanup_lock = asyncio.Lock()
@@ -70,9 +73,14 @@ class ForceJoinPlugin(Star):
             logger.error(f"ForceJoin API 调用失败 [{action}]: {e}")
             return None
 
-    async def _kick(self, group_id: str, user_id: str):
-        await self._call("set_group_kick", group_id=int(group_id),
-                         user_id=int(user_id), reject_add_request=False)
+    async def _kick(self, group_id: str, user_id: str) -> bool:
+        try:
+            await self._api.call_action("set_group_kick", group_id=int(group_id),
+                                        user_id=int(user_id), reject_add_request=False)
+            return True
+        except Exception as e:
+            logger.error(f"ForceJoin API 调用失败 [set_group_kick]: {e}")
+            return False
 
     async def _mute(self, group_id: str, user_id: str):
         await self._call("set_group_ban", group_id=int(group_id),
@@ -82,13 +90,30 @@ class ForceJoinPlugin(Star):
         await self._call("set_group_ban", group_id=int(group_id),
                          user_id=int(user_id), duration=0)
 
-    async def _find_joined_target(self, user_id: str, targets: list[str]) -> str | None:
+    async def _find_joined_target(self, user_id: str,
+                                  targets: list[str]) -> tuple[str | None, bool]:
+        """返回已加入的目标群，以及是否已确认成员状态。"""
+        confirmed = True
         for group_id in targets:
-            info = await self._call("get_group_member_info",
-                                    group_id=int(group_id), user_id=int(user_id))
-            if info is not None:
-                return group_id
-        return None
+            try:
+                info = await self._api.call_action(
+                    "get_group_member_info", group_id=int(group_id),
+                    user_id=int(user_id), no_cache=True)
+            except Exception as e:
+                missing = f"群({group_id})成员{user_id}不存在"
+                if isinstance(e, ActionFailed) and missing in (
+                    e.result.get("message"), e.result.get("wording"),
+                ):
+                    logger.debug(f"ForceJoin: {user_id} 尚未加入目标群 {group_id}")
+                else:
+                    confirmed = False
+                    logger.error(f"ForceJoin: 查询目标群 {group_id} 成员 {user_id} 失败，暂缓判定: {e}")
+                continue
+            if isinstance(info, dict) and str(info.get("user_id")) == user_id:
+                return group_id, True
+            confirmed = False
+            logger.warning(f"ForceJoin: 目标群 {group_id} 返回无效成员信息，暂缓判定 {user_id}")
+        return None, confirmed
 
     async def _check_privilege(self, group_id: str, user_id: str) -> bool:
         info = await self._call("get_group_member_info",
@@ -97,49 +122,60 @@ class ForceJoinPlugin(Star):
             return str(info.get("role", "")).lower() in ("owner", "admin")
         return False
 
-    # ── 后台踢出 ─────────────────────────────────────────────────
+    # ── 后台验证与超时踢出 ───────────────────────────────────────
 
     async def _kick_loop(self):
         while True:
             try:
                 await asyncio.sleep(10)
-                await self._kick_expired()
+                await self._check_pending_users()
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"ForceJoin 踢出循环出错: {e}")
+                logger.error(f"ForceJoin 待处理成员检查出错: {e}")
 
-    async def _kick_expired(self):
-        if self._api is None:
+    async def _check_pending_users(self):
+        if self._api is None or not self.pending_users:
+            return
+        targets = self._get_target_groups()
+        if not targets:
             return
         timeout_seconds = int(self.config.get("timeout_minutes", 10)) * 60
-        now = time.time()
         reason = self.config.get("kick_reason", "未在规定时间内加入目标群")
 
-        expired = [(k, v) for k, v in self.pending_users.items()
-                   if now - v["join_time"] >= timeout_seconds]
-        if not expired:
-            return
+        user_ids = {info["user_id"] for info in self.pending_users.values()}
+        for user_id in user_ids:
+            joined_target, confirmed = await self._find_joined_target(user_id, targets)
+            if joined_target:
+                await self._handle_target_join(user_id, joined_target)
+                continue
+            if not confirmed:
+                continue
 
-        for key, info in expired:
-            if info.get("muted"):
-                await self._unmute(info["group_id"], info["user_id"])
-            await self._kick(info["group_id"], info["user_id"])
-            logger.info(f"ForceJoin: 超时踢出 {info['user_id']}，原因: {reason}")
-            del self.pending_users[key]
-
-        await self.put_kv_data("pending_users", self.pending_users)
+            async with self._pending_lock:
+                now = time.time()
+                expired = [(k, v) for k, v in self.pending_users.items()
+                           if v["user_id"] == user_id
+                           and now - v["join_time"] >= timeout_seconds]
+                for key, info in expired:
+                    if info.get("muted"):
+                        await self._unmute(info["group_id"], info["user_id"])
+                    await self._kick(info["group_id"], info["user_id"])
+                    logger.info(f"ForceJoin: 超时踢出 {user_id}，原因: {reason}")
+                    del self.pending_users[key]
+                if expired:
+                    await self.put_kv_data("pending_users", self.pending_users)
 
     # ── 目标群清理 ───────────────────────────────────────────────
 
-    async def _get_source_groups(self, targets: list[str]) -> list[str]:
+    async def _get_source_groups(self, targets: list[str]) -> list[str] | None:
         whitelist = self.config.get("group_whitelist", [])
         if whitelist:
             groups = [str(g) for g in whitelist]
         else:
             groups_info = await self._call("get_group_list")
             if not isinstance(groups_info, list):
-                return []
+                return None
             groups = [str(g["group_id"]) for g in groups_info]
         return list(dict.fromkeys(g for g in groups if self._is_source_group(g, targets)))
 
@@ -155,17 +191,26 @@ class ForceJoinPlugin(Star):
                 logger.error(f"ForceJoin 目标群清理循环出错: {e}")
 
     async def _cleanup_target_groups(self, user_id: str | None = None,
-                                      left_group_id: str | None = None):
-        if not self.config.get("target_cleanup_enabled", False) or self._api is None:
-            return
+                                      left_group_id: str | None = None,
+                                      *, manual: bool = False) -> str:
+        if not manual and not self.config.get("target_cleanup_enabled", False):
+            return "目标群自动清理未开启。"
+        if self._api is None:
+            return "❌ 机器人 API 尚未就绪，本次未执行清理。"
         targets = self._get_target_groups()
         if not targets:
-            return
+            return "⚠️ 请先配置目标群，本次未执行清理。"
+        if manual and self._cleanup_lock.locked():
+            return "⏳ 已有目标群清理任务正在执行，请稍后再试。"
 
         async with self._cleanup_lock:
             sources = await self._get_source_groups(targets)
-            if not sources or (left_group_id is not None and left_group_id not in sources):
-                return
+            if sources is None:
+                return "❌ 获取机器人群列表失败，本次未执行清理。"
+            if not sources:
+                return "⚠️ 没有可检查的生效群，本次未执行清理。"
+            if left_group_id is not None and left_group_id not in sources:
+                return "退群事件来自生效范围之外，本次未执行清理。"
 
             source_members = set()
             for group_id in sources:
@@ -175,29 +220,40 @@ class ForceJoinPlugin(Star):
                 members = await self._call("get_group_member_list", group_id=int(group_id))
                 if not isinstance(members, list):
                     logger.warning(f"ForceJoin: 无法获取生效群 {group_id} 的成员，跳过本次目标群清理")
-                    return
+                    return f"❌ 获取生效群 {group_id} 的成员失败，本次未执行清理。"
                 source_members.update(str(member["user_id"]) for member in members)
                 if user_id is not None and user_id in source_members:
-                    return
+                    return "成员仍在其他生效群，无需清理。"
 
             login = await self._call("get_login_info")
             if not login:
-                return
+                return "❌ 获取机器人身份失败，本次未执行清理。"
             exempt_users = {str(u) for u in self.config.get("user_whitelist", [])}
             exempt_users.add(str(login["user_id"]))
 
+            checked = removed = failed = skipped = 0
             for target in targets:
                 members = await self._call("get_group_member_list", group_id=int(target))
                 if not isinstance(members, list):
+                    skipped += 1
                     continue
+                checked += 1
                 for member in members:
                     member_id = str(member["user_id"])
                     if user_id is not None and member_id != user_id:
                         continue
                     if member_id in source_members or member_id in exempt_users:
                         continue
-                    await self._kick(target, member_id)
-                    logger.info(f"ForceJoin: 请求从目标群 {target} 移出 {member_id}，已不在任何生效群")
+                    if await self._kick(target, member_id):
+                        removed += 1
+                        logger.info(f"ForceJoin: 从目标群 {target} 移出 {member_id}，已不在任何生效群")
+                    else:
+                        failed += 1
+
+            icon = "⚠️" if failed or skipped else "✅"
+            return (f"{icon} 目标群清理结束：已检查 {checked} 个目标群，"
+                    f"成功移出 {removed} 人次，移出失败 {failed} 人次，"
+                    f"跳过 {skipped} 个目标群。")
 
     # ── 事件 ─────────────────────────────────────────────────────
 
@@ -220,8 +276,9 @@ class ForceJoinPlugin(Star):
             if notice_type == "group_decrease":
                 if raw.get("sub_type") == "kick_me" or user_id == str(raw.get("self_id", "")):
                     return
-                if self.pending_users.pop(f"{group_id}:{user_id}", None) is not None:
-                    await self.put_kv_data("pending_users", self.pending_users)
+                async with self._pending_lock:
+                    if self.pending_users.pop(f"{group_id}:{user_id}", None) is not None:
+                        await self.put_kv_data("pending_users", self.pending_users)
                 if self._is_source_group(group_id, targets):
                     await self._cleanup_target_groups(user_id, group_id)
                 return
@@ -236,30 +293,32 @@ class ForceJoinPlugin(Star):
             logger.error(f"ForceJoin 事件处理出错: {e}")
 
     async def _handle_target_join(self, user_id: str, target: str):
-        matched = [k for k, v in self.pending_users.items()
-                   if v["user_id"] == user_id]
-        if not matched:
-            return
+        async with self._pending_lock:
+            matched = [k for k, v in self.pending_users.items()
+                       if v["user_id"] == user_id]
+            if not matched:
+                logger.debug(f"ForceJoin: {user_id} 加入目标群 {target}，当前无待处理记录")
+                return
 
-        for key in matched:
-            info = self.pending_users[key]
-            if info.get("muted"):
-                await self._unmute(info["group_id"], info["user_id"])
+            for key in matched:
+                info = self.pending_users[key]
+                if info.get("muted"):
+                    await self._unmute(info["group_id"], info["user_id"])
 
-            umo = info.get("umo")
-            if umo:
-                text = self.config.get("completed_welcome_text",
-                                       "新成员 {user_id} 已加入目标群，欢迎！")
-                msg = text.format(user_id=user_id, target_group=target,
-                                  group_id=info["group_id"],
-                                  timeout=self.config.get("timeout_minutes", 10))
-                chain = MessageChain([Comp.At(qq=user_id), Comp.Plain(" " + msg)])
-                await self.context.send_message(umo, chain)
+                umo = info.get("umo")
+                if umo:
+                    text = self.config.get("completed_welcome_text",
+                                           "新成员 {user_id} 已加入目标群，欢迎！")
+                    msg = text.format(user_id=user_id, target_group=target,
+                                      group_id=info["group_id"],
+                                      timeout=self.config.get("timeout_minutes", 10))
+                    chain = MessageChain([Comp.At(qq=user_id), Comp.Plain(" " + msg)])
+                    await self.context.send_message(umo, chain)
 
-            logger.info(f"ForceJoin: {user_id} 已加入目标群 {target}")
-            del self.pending_users[key]
+                logger.info(f"ForceJoin: {user_id} 已加入目标群 {target}，原群 {info['group_id']} 验证完成")
+                del self.pending_users[key]
 
-        await self.put_kv_data("pending_users", self.pending_users)
+            await self.put_kv_data("pending_users", self.pending_users)
 
     async def _handle_source_join(self, event, group_id: str, user_id: str,
                                   targets: list[str]):
@@ -275,7 +334,7 @@ class ForceJoinPlugin(Star):
         if user_id in [str(u) for u in self.config.get("user_whitelist", [])]:
             return
 
-        joined_target = await self._find_joined_target(user_id, targets)
+        joined_target, _ = await self._find_joined_target(user_id, targets)
         if joined_target:
             logger.info(f"ForceJoin: {user_id} 已在目标群 {joined_target}")
             text = self.config.get("completed_welcome_text",
@@ -304,14 +363,33 @@ class ForceJoinPlugin(Star):
             [Comp.At(qq=user_id), Comp.Plain(" " + msg)]))
 
         key = f"{group_id}:{user_id}"
-        self.pending_users[key] = {
-            "group_id": group_id, "user_id": user_id,
-            "join_time": time.time(), "muted": muted,
-            "umo": event.unified_msg_origin,
-        }
-        await self.put_kv_data("pending_users", self.pending_users)
+        async with self._pending_lock:
+            self.pending_users[key] = {
+                "group_id": group_id, "user_id": user_id,
+                "join_time": time.time(), "muted": muted,
+                "umo": event.unified_msg_origin,
+            }
+            await self.put_kv_data("pending_users", self.pending_users)
 
     # ── 指令 ─────────────────────────────────────────────────────
+
+    @filter.command("forcejoin_cleanup")
+    async def cmd_cleanup(self, event: AstrMessageEvent):
+        gid = event.get_group_id()
+        if not gid:
+            yield event.plain_result("❌ 仅限群聊中使用。")
+            return
+        targets = self._get_target_groups()
+        if gid not in targets and not self._is_source_group(gid, targets):
+            yield event.plain_result("❌ 请在生效群或目标群中使用此命令。")
+            return
+        if not await self._check_privilege(gid, event.get_sender_id()):
+            yield event.plain_result("❌ 仅群主/管理员可触发清理。")
+            return
+
+        yield event.plain_result("⏳ 正在触发全部目标群的清理检查，请稍候。")
+        result = await self._cleanup_target_groups(manual=True)
+        yield event.plain_result(result)
 
     @filter.command("forcejoin_status")
     async def cmd_status(self, event: AstrMessageEvent):
@@ -354,12 +432,14 @@ class ForceJoinPlugin(Star):
             yield event.plain_result("❌ 仅群主/管理员可操作。")
             return
 
-        removed = [k for k, v in list(self.pending_users.items())
-                   if v["user_id"] == str(user_id) and v["group_id"] == gid]
-        for k in removed:
-            del self.pending_users[k]
+        async with self._pending_lock:
+            removed = [k for k, v in self.pending_users.items()
+                       if v["user_id"] == str(user_id) and v["group_id"] == gid]
+            for k in removed:
+                del self.pending_users[k]
+            if removed:
+                await self.put_kv_data("pending_users", self.pending_users)
         if removed:
-            await self.put_kv_data("pending_users", self.pending_users)
             yield event.plain_result(f"✅ 已移除 {user_id}。")
         else:
             yield event.plain_result(f"❌ 未找到 {user_id}。")
