@@ -1,20 +1,39 @@
 {
+  "target_group_ids": {
+    "description": "目标群号列表",
+    "type": "list",
+    "default": [],
+    "hint": "每项填写一个目标群号，新成员加入其中任意一个群即可完成验证。列表非空时优先使用此配置。"
+  },
   "target_group_id": {
-    "description": "目标群号",
+    "description": "单目标群号（兼容旧配置）",
     "type": "string",
-    "hint": "新成员必须加入的目标群号。留空则插件不生效。"
+    "default": "",
+    "hint": "目标群号列表为空时使用此群号。两项均为空时插件不生效。"
+  },
+  "target_cleanup_enabled": {
+    "description": "自动清理目标群成员",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，定时检查及生效群退群事件会触发清理；已不在任何生效群的成员会被移出所有目标群。生效范围沿用群白名单/黑名单，白名单为空时使用机器人加入的所有非目标生效群。机器人自身和豁免用户会被保留。"
+  },
+  "target_cleanup_interval_minutes": {
+    "description": "目标群清理间隔（分钟）",
+    "type": "int",
+    "default": 10,
+    "hint": "自动清理开启后，按此间隔检查目标群成员，最小为 1 分钟。退群事件会立即触发检查。"
   },
   "timeout_minutes": {
     "description": "加群时限（分钟）",
     "type": "int",
     "default": 10,
-    "hint": "新成员入群后需在此时间内加入目标群，超时将被自动移出。"
+    "hint": "新成员入群后需在此时间内加入任意一个目标群，超时将被自动移出。"
   },
   "welcome_text": {
     "description": "入群引导消息",
     "type": "text",
-    "default": "欢迎新成员！请在 {timeout} 分钟内加入目标群 {target_group}，否则将被移出本群。",
-    "hint": "新成员入群时自动 @ 对方并发送此消息。可用占位符：{timeout}、{target_group}、{user_id}、{group_id}"
+    "default": "欢迎新成员！请在 {timeout} 分钟内加入以下任意一个目标群：{target_group}，否则将被移出本群。",
+    "hint": "新成员入群时自动 @ 对方并发送此消息。{target_group} 为所有候选目标群号，以顿号分隔。可用占位符：{timeout}、{target_group}、{user_id}、{group_id}"
   },
   "kick_reason": {
     "description": "踢出理由",
@@ -38,13 +57,13 @@
     "description": "入群自动禁言",
     "type": "bool",
     "default": false,
-    "hint": "开启后，新成员入群时立即禁言；在时限内加入目标群后自动解除禁言。"
+    "hint": "开启后，新成员入群时立即禁言；在时限内加入任意一个目标群后自动解除禁言。"
   },
   "user_whitelist": {
     "description": "豁免用户（QQ号）",
     "type": "list",
     "default": [],
-    "hint": "列表中的用户入群后不触发任何规则，既不会收到引导消息，也不会被移出。"
+    "hint": "列表中的用户免于入群验证和目标群自动清理。若同时配置了拒绝用户，入群时优先执行拒绝规则。"
   },
   "user_blacklist": {
     "description": "拒绝用户（QQ号）",
@@ -56,6 +75,6 @@
     "description": "完成加群通知",
     "type": "text",
     "default": "新成员 {user_id} 已加入目标群，欢迎！",
-    "hint": "成员成功加入目标群后自动在原群 @ 对方并发送此消息。可用占位符：{timeout}、{target_group}、{user_id}、{group_id}"
+    "hint": "成员成功加入任意一个目标群后自动在原群 @ 对方并发送此消息。{target_group} 为实际加入或检测到已加入的目标群号。可用占位符：{timeout}、{target_group}、{user_id}、{group_id}"
   }
 }
