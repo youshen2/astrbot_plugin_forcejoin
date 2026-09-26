@@ -2,7 +2,7 @@ name: astrbot_plugin_forcejoin
 display_name: 强制入群
 desc: 新成员须在限定时间内加入任意一个目标群，并可自动清理已退出所有生效群的目标群成员
 short_desc: 多目标群入群验证与退群联动清理
-version: v1.1.1
+version: v1.1.2
 author: 爅峫
 repo: https://github.com/youshen2/astrbot_plugin_forcejoin
 support_platforms:

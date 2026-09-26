@@ -10,7 +10,7 @@ from astrbot.api.star import Context, Star, register
 import astrbot.api.message_components as Comp
 
 
-@register("forcejoin", "爅峫", "支持多目标群验证及目标群成员自动清理", "1.1.1")
+@register("forcejoin", "爅峫", "支持多目标群验证及目标群成员自动清理", "1.1.2")
 class ForceJoinPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
@@ -90,11 +90,11 @@ class ForceJoinPlugin(Star):
         await self._call("set_group_ban", group_id=int(group_id),
                          user_id=int(user_id), duration=0)
 
-    async def _find_joined_target(self, user_id: str,
-                                  targets: list[str]) -> tuple[str | None, bool]:
-        """返回已加入的目标群，以及是否已确认成员状态。"""
+    async def _find_joined_group(self, user_id: str,
+                                 groups: list[str]) -> tuple[str | None, bool]:
+        """实时查找已加入的群；所有群均明确返回成员不存在才确认未加入。"""
         confirmed = True
-        for group_id in targets:
+        for group_id in groups:
             try:
                 info = await self._api.call_action(
                     "get_group_member_info", group_id=int(group_id),
@@ -104,15 +104,15 @@ class ForceJoinPlugin(Star):
                 if isinstance(e, ActionFailed) and missing in (
                     e.result.get("message"), e.result.get("wording"),
                 ):
-                    logger.debug(f"ForceJoin: {user_id} 尚未加入目标群 {group_id}")
+                    logger.debug(f"ForceJoin: 群 {group_id} 中不存在成员 {user_id}")
                 else:
                     confirmed = False
-                    logger.error(f"ForceJoin: 查询目标群 {group_id} 成员 {user_id} 失败，暂缓判定: {e}")
+                    logger.error(f"ForceJoin: 查询群 {group_id} 成员 {user_id} 失败，暂缓判定: {e}")
                 continue
             if isinstance(info, dict) and str(info.get("user_id")) == user_id:
                 return group_id, True
             confirmed = False
-            logger.warning(f"ForceJoin: 目标群 {group_id} 返回无效成员信息，暂缓判定 {user_id}")
+            logger.warning(f"ForceJoin: 群 {group_id} 返回无效成员信息，暂缓判定 {user_id}")
         return None, confirmed
 
     async def _check_privilege(self, group_id: str, user_id: str) -> bool:
@@ -145,7 +145,7 @@ class ForceJoinPlugin(Star):
 
         user_ids = {info["user_id"] for info in self.pending_users.values()}
         for user_id in user_ids:
-            joined_target, confirmed = await self._find_joined_target(user_id, targets)
+            joined_target, confirmed = await self._find_joined_group(user_id, targets)
             if joined_target:
                 await self._handle_target_join(user_id, joined_target)
                 continue
@@ -214,16 +214,14 @@ class ForceJoinPlugin(Star):
 
             source_members = set()
             for group_id in sources:
-                # 退群事件已确认此人在该群离开，避免成员列表缓存影响判断。
-                if group_id == left_group_id:
-                    continue
-                members = await self._call("get_group_member_list", group_id=int(group_id))
+                # NapCat 单人成员查询也依赖群成员缓存，先请求刷新各生效群列表。
+                members = await self._call("get_group_member_list", group_id=int(group_id), no_cache=True)
                 if not isinstance(members, list):
                     logger.warning(f"ForceJoin: 无法获取生效群 {group_id} 的成员，跳过本次目标群清理")
                     return f"❌ 获取生效群 {group_id} 的成员失败，本次未执行清理。"
-                source_members.update(str(member["user_id"]) for member in members)
-                if user_id is not None and user_id in source_members:
-                    return "成员仍在其他生效群，无需清理。"
+                # 列表中的成员可直接保留；退群事件所属群在移出前重新核实。
+                if group_id != left_group_id:
+                    source_members.update(str(member["user_id"]) for member in members)
 
             login = await self._call("get_login_info")
             if not login:
@@ -232,8 +230,9 @@ class ForceJoinPlugin(Star):
             exempt_users.add(str(login["user_id"]))
 
             checked = removed = failed = skipped = 0
+            deferred_users = set()
             for target in targets:
-                members = await self._call("get_group_member_list", group_id=int(target))
+                members = await self._call("get_group_member_list", group_id=int(target), no_cache=True)
                 if not isinstance(members, list):
                     skipped += 1
                     continue
@@ -244,16 +243,29 @@ class ForceJoinPlugin(Star):
                         continue
                     if member_id in source_members or member_id in exempt_users:
                         continue
+                    if member_id in deferred_users:
+                        continue
+                    # 每次移出前确认所有生效群，退群事件所属群也可能已经重新加入。
+                    joined_source, confirmed = await self._find_joined_group(member_id, sources)
+                    if joined_source:
+                        source_members.add(member_id)
+                        logger.info(f"ForceJoin: {member_id} 仍在生效群 {joined_source}，保留目标群资格")
+                        continue
+                    if not confirmed:
+                        deferred_users.add(member_id)
+                        logger.warning(f"ForceJoin: 无法确认 {member_id} 的生效群状态，本轮暂缓清理该成员")
+                        continue
                     if await self._kick(target, member_id):
                         removed += 1
-                        logger.info(f"ForceJoin: 从目标群 {target} 移出 {member_id}，已不在任何生效群")
+                        logger.info(f"ForceJoin: 从目标群 {target} 移出 {member_id}，"
+                                    f"已确认不在任何生效群（{'、'.join(sources)}）")
                     else:
                         failed += 1
 
-            icon = "⚠️" if failed or skipped else "✅"
+            icon = "⚠️" if failed or skipped or deferred_users else "✅"
             return (f"{icon} 目标群清理结束：已检查 {checked} 个目标群，"
                     f"成功移出 {removed} 人次，移出失败 {failed} 人次，"
-                    f"跳过 {skipped} 个目标群。")
+                    f"跳过 {skipped} 个目标群，状态不确定暂缓 {len(deferred_users)} 人。")
 
     # ── 事件 ─────────────────────────────────────────────────────
 
@@ -334,7 +346,7 @@ class ForceJoinPlugin(Star):
         if user_id in [str(u) for u in self.config.get("user_whitelist", [])]:
             return
 
-        joined_target, _ = await self._find_joined_target(user_id, targets)
+        joined_target, _ = await self._find_joined_group(user_id, targets)
         if joined_target:
             logger.info(f"ForceJoin: {user_id} 已在目标群 {joined_target}")
             text = self.config.get("completed_welcome_text",
